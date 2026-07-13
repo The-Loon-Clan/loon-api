@@ -1,0 +1,29 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: demo
+      POSTGRES_PASSWORD: demo
+      POSTGRES_DB: loon_demo
+    ports:
+      # 5545 so this can run alongside the web demo (which publishes 5544).
+      - "5545:5432"
+
+  api:
+    build:
+      context: .
+      # loon + loon-plugins are sibling checkouts the go.mod replaces point at;
+      # supply them to the build as named contexts (BuildKit). See Dockerfile.
+      additional_contexts:
+        loon: ../loon
+        loonplugins: ../loon-plugins
+    environment:
+      # In a real deployment this points at the SAME database the web/worker
+      # processes use (or a read replica); here it's a private demo db.
+      LOON_API_DSN: "postgres://demo:demo@db:5432/loon_demo?sslmode=disable"
+      LOON_API_ADDR: ":8091"
+    ports:
+      - "8091:8091"
+    depends_on:
+      - db
+    restart: unless-stopped
