@@ -9,21 +9,31 @@ services:
       # 5545 so this can run alongside the web demo (which publishes 5544).
       - "5545:5432"
 
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6390:6379"
+
   api:
     build:
       context: .
-      # loon + loon-plugins are sibling checkouts the go.mod replaces point at;
-      # supply them to the build as named contexts (BuildKit). See Dockerfile.
+      # loon + loon-plugins + loon-baseline are sibling checkouts the go.mod
+      # replaces point at; supply them to the build as named contexts (BuildKit).
       additional_contexts:
         loon: ../loon
         loonplugins: ../loon-plugins
+        loonbaseline: ../loon-baseline
     environment:
       # In a real deployment this points at the SAME database the web/worker
       # processes use (or a read replica); here it's a private demo db.
       LOON_API_DSN: "postgres://demo:demo@db:5432/loon_demo?sslmode=disable"
       LOON_API_ADDR: ":8091"
+      # Shared response cache. Several api workers behind a load balancer point
+      # at one Redis; unset falls back to a per-process in-memory cache.
+      REDIS_ADDR: "${REDIS_ADDR-redis:6379}"
     ports:
       - "8091:8091"
     depends_on:
       - db
+      - redis
     restart: unless-stopped
