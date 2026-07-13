@@ -36,6 +36,9 @@ import (
 	cachememory "github.com/ameNZB/loon-baseline/cache/memory"
 	cacheredis "github.com/ameNZB/loon-baseline/cache/redis"
 	"github.com/ameNZB/loon-baseline/jobsettings"
+	"github.com/ameNZB/loon-baseline/ratelimit"
+	rlmemory "github.com/ameNZB/loon-baseline/ratelimit/memory"
+	rlredis "github.com/ameNZB/loon-baseline/ratelimit/redis"
 
 	"github.com/ameNZB/loon-plugins/pluginapi"
 	_ "github.com/ameNZB/loon-plugins/usenet"
@@ -72,6 +75,10 @@ func main() {
 			Description: "How long search/tvsearch/movie/rss responses stay cached."},
 		schedule.JobConfigVar{Key: "caps_ttl_secs", Label: "Caps cache TTL (seconds)", Type: schedule.JobConfigInt, Default: "3600",
 			Description: "How long the caps (category tree) response stays cached — nearly static."},
+		schedule.JobConfigVar{Key: "rate_per_min", Label: "Requests per minute", Type: schedule.JobConfigInt, Default: "60",
+			Description: "Per-API-key (or IP) request cap per minute — burst protection. 0 disables."},
+		schedule.JobConfigVar{Key: "rate_per_day", Label: "Requests per day", Type: schedule.JobConfigInt, Default: "10000",
+			Description: "Per-API-key (or IP) request cap per day — the daily quota. 0 disables."},
 	)
 
 	engine := gin.New()
@@ -136,22 +143,45 @@ func main() {
 		api, _ = v.(pluginapi.UsenetNewznab)
 	}
 
-	// Read-through cache in front of the Newznab responses — the whole point of
-	// a read tier. Redis when REDIS_ADDR is set (the deployed shape: many api
-	// workers sharing one Redis), in-memory otherwise (dev). Best-effort: a
-	// Redis outage degrades to serving straight from the plugin.
-	var responses cache.Cache
+	// Shared Redis (deployed shape: many api workers, one Redis) backs both the
+	// response cache and the rate-limit counters when REDIS_ADDR is set;
+	// otherwise both fall back to per-process in-memory impls (dev). One client
+	// for both.
+	var rdb *goredis.Client
 	if addr := getenv("REDIS_ADDR", ""); addr != "" {
-		responses = cacheredis.New(goredis.NewClient(&goredis.Options{Addr: addr}))
-		logger.Info("response cache", "backend", "redis", "addr", addr)
-	} else {
-		responses = cachememory.New()
-		logger.Info("response cache", "backend", "memory")
+		rdb = goredis.NewClient(&goredis.Options{Addr: addr})
 	}
 
+	// Read-through cache in front of the Newznab responses — the whole point of
+	// a read tier. Best-effort: a Redis outage degrades to serving from the plugin.
+	var responses cache.Cache
+	var counter ratelimit.Counter
+	if rdb != nil {
+		responses = cacheredis.New(rdb)
+		counter = rlredis.New(rdb)
+		logger.Info("response cache + rate limiter", "backend", "redis")
+	} else {
+		responses = cachememory.New()
+		counter = rlmemory.New()
+		logger.Info("response cache + rate limiter", "backend", "memory")
+	}
+
+	// Per-caller request limiting (burst + daily quota), keyed by API key when
+	// present else client IP, limits read live from the admin settings (0 =
+	// off). A Newznab client sees the spec's "Request limit reached" error.
+	limiter := ratelimit.Middleware(ratelimit.Config{
+		Counter: counter,
+		Key:     apiKeyOrIP,
+		Rules: []ratelimit.Rule{
+			{Name: "min", Window: time.Minute, Limit: func() int { return apiSvc.GetConfigInt("rate_per_min") }},
+			{Name: "day", Window: 24 * time.Hour, Limit: func() int { return apiSvc.GetConfigInt("rate_per_day") }},
+		},
+		OnLimit: newznabLimitError,
+	})
+
 	engine.GET("/healthz", func(g *gin.Context) { g.String(http.StatusOK, "ok") })
-	engine.GET("/api", newznab(api, responses, apiSvc)) // Newznab/Torznab: t=caps|search|tvsearch|movie|rss|get
-	engine.GET("/rss", newznab(api, responses, apiSvc))
+	engine.GET("/api", limiter, newznab(api, responses, apiSvc)) // Newznab/Torznab: t=caps|search|tvsearch|movie|rss|get
+	engine.GET("/rss", limiter, newznab(api, responses, apiSvc))
 	engine.GET("/nzb/:id", nzb(idx))
 
 	srv := &http.Server{Addr: getenv("LOON_API_ADDR", ":8091"), Handler: engine}
@@ -261,6 +291,25 @@ func ttlFor(svc *schedule.JobInfo, fn string) time.Duration {
 		secs = fallback
 	}
 	return time.Duration(secs) * time.Second
+}
+
+// apiKeyOrIP attributes a request to a caller for rate limiting: the API key
+// when present, else the client IP. The k:/ip: prefixes keep the two key spaces
+// from colliding.
+func apiKeyOrIP(g *gin.Context) string {
+	if k := g.Query("apikey"); k != "" {
+		return "k:" + k
+	}
+	return "ip:" + g.ClientIP()
+}
+
+// newznabLimitError renders an over-limit rejection as a Newznab error document
+// (code 500 = "Request limit reached" in the Newznab spec) so Prowlarr/Sonarr
+// surface it correctly, alongside the standard 429 + Retry-After the middleware
+// already set.
+func newznabLimitError(g *gin.Context, _ time.Duration) {
+	g.Data(http.StatusTooManyRequests, "application/xml; charset=utf-8",
+		[]byte(`<?xml version="1.0" encoding="UTF-8"?>`+"\n"+`<error code="500" description="Request limit reached"/>`))
 }
 
 func nzb(idx pluginapi.UsenetIndex) gin.HandlerFunc {
