@@ -98,8 +98,8 @@ func main() {
 
 	apiSvc := schedule.RegisterService(apiServiceName, "Newznab/Torznab read tier (loon-api)")
 	apiSvc.DeclareConfig(settings,
-		schedule.JobConfigVar{Key: "cache_ttl_secs", Label: "Search cache TTL (seconds)", Type: schedule.JobConfigInt, Default: "90",
-			Description: "How long search/tvsearch/movie/rss responses stay cached."},
+		schedule.JobConfigVar{Key: "cache_ttl_secs", Label: "Search cache TTL (seconds)", Type: schedule.JobConfigInt, Default: "3600",
+			Description: "How long search/tvsearch/movie/rss responses stay cached. Safe to keep long: an ingest invalidates the namespace, so entries don't go stale until then."},
 		schedule.JobConfigVar{Key: "caps_ttl_secs", Label: "Caps cache TTL (seconds)", Type: schedule.JobConfigInt, Default: "3600",
 			Description: "How long the caps (category tree) response stays cached — nearly static."},
 		schedule.JobConfigVar{Key: "rate_per_min", Label: "Requests per minute", Type: schedule.JobConfigInt, Default: "60",
