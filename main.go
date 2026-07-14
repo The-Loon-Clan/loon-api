@@ -12,9 +12,6 @@ package main
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"log/slog"
 	"net/http"
 	"os"
@@ -237,13 +234,6 @@ func main() {
 	_ = srv.Shutdown(sc)
 }
 
-// cachedResp is the serialized Newznab response stored in the cache.
-type cachedResp struct {
-	Body        []byte `json:"b"`
-	ContentType string `json:"c"`
-	Filename    string `json:"f"`
-}
-
 func newznab(api pluginapi.UsenetNewznab, ca cache.Cache, svc *schedule.JobInfo) gin.HandlerFunc {
 	return func(g *gin.Context) {
 		if api == nil {
@@ -265,14 +255,15 @@ func newznab(api pluginapi.UsenetNewznab, ca cache.Cache, svc *schedule.JobInfo)
 		}
 
 		// Cache read functions only. t=get streams a (potentially large) NZB —
-		// don't hold those in Redis.
+		// don't hold those in Redis. The key is shared with any other tier (see
+		// pluginapi.NewznabCacheKey), so a common Redis is hit-compatible.
 		cacheable := ca != nil && req.Function != "get"
 		var key string
 		if cacheable {
-			key = newznabKey(req)
-			var cr cachedResp
-			if ok, _ := cache.GetJSON(g.Request.Context(), ca, key, &cr); ok {
-				writeResp(g, cr, "hit")
+			key = pluginapi.NewznabCacheKey(req)
+			var cached pluginapi.NewznabResult
+			if ok, _ := cache.GetJSON(g.Request.Context(), ca, key, &cached); ok {
+				writeResp(g, cached, "hit")
 				return
 			}
 		}
@@ -282,36 +273,19 @@ func newznab(api pluginapi.UsenetNewznab, ca cache.Cache, svc *schedule.JobInfo)
 			g.String(http.StatusInternalServerError, "api error")
 			return
 		}
-		cr := cachedResp{Body: res.Body, ContentType: res.ContentType, Filename: res.Filename}
 		if cacheable {
-			_ = cache.SetJSON(g.Request.Context(), ca, key, cr, ttlFor(svc, req.Function))
+			_ = cache.SetJSON(g.Request.Context(), ca, key, res, ttlFor(svc, req.Function))
 		}
-		writeResp(g, cr, "miss")
+		writeResp(g, res, "miss")
 	}
 }
 
-func writeResp(g *gin.Context, cr cachedResp, status string) {
-	if cr.Filename != "" {
-		g.Header("Content-Disposition", `attachment; filename="`+cr.Filename+`"`)
+func writeResp(g *gin.Context, res pluginapi.NewznabResult, status string) {
+	if res.Filename != "" {
+		g.Header("Content-Disposition", `attachment; filename="`+res.Filename+`"`)
 	}
 	g.Header("X-Cache", status)
-	g.Data(http.StatusOK, cr.ContentType, cr.Body)
-}
-
-// newznabKey hashes the request fields that determine the response. BaseURL is
-// excluded (constant per deployment / public host); APIKey is INCLUDED because
-// the plugin embeds it in the download links, so two keys must not share an
-// entry.
-func newznabKey(r pluginapi.NewznabRequest) string {
-	payload := struct {
-		T, Q  string
-		C     []int
-		L, O  int
-		ID, K string
-	}{r.Function, r.Query, r.Categories, r.Limit, r.Offset, r.ID, r.APIKey}
-	b, _ := json.Marshal(payload)
-	sum := sha256.Sum256(b)
-	return "newznab:v1:" + hex.EncodeToString(sum[:16])
+	g.Data(http.StatusOK, res.ContentType, res.Body)
 }
 
 // ttlFor picks a per-function TTL from the read tier's admin-editable settings
